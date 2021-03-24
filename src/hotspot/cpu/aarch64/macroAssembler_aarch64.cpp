@@ -5383,73 +5383,60 @@ int MacroAssembler::store_inline_type_fields_to_buf(ciInlineKlass* vk, bool from
   br(Assembler::EQ, skip);
   int call_offset = -1;
 
+  // The following code is similar to allocate_instance but has some slight differences,
+  // e.g. object size is always not zero, sometimes it's constant; storing klass ptr after
+  // allocating is not necessary if vk != NULL, etc. allocate_instance is not aware of these.
   Label slow_case;
-
-  // Try to allocate a new buffered inline type (from the heap)
-  if (UseTLAB) {
-
-    if (vk != NULL) {
-      // Called from C1, where the return type is statically known.
-      mov(r1, (intptr_t)vk->get_InlineKlass());
-      jint lh = vk->layout_helper();
-      assert(lh != Klass::_lh_neutral_value, "inline class in return type must have been resolved");
-      mov(r14, lh);
+  // 1. Try to allocate a new buffered inline instance either from TLAB or eden space
+  mov(rscratch1, r0); // save r0 for slow_case since *_allocate may corrupt it when allocation failed
+  if (vk != NULL) {
+    // Called from C1, where the return type is statically known.
+    mov(r1, (intptr_t)vk->get_InlineKlass());
+    jint obj_size = vk->layout_helper();
+    assert(obj_size != Klass::_lh_neutral_value, "inline class in return type must have been resolved");
+    if (UseTLAB) {
+      tlab_allocate(rthread, r0, noreg/*dummy*/, obj_size, r13, r14, slow_case);
     } else {
-       // Call from interpreter. R0 contains ((the InlineKlass* of the return type) | 0x01)
-       andr(r1, r0, -2);
-       // get obj size
-       ldrw(r14, Address(rscratch1 /*klass*/, Klass::layout_helper_offset()));
+      eden_allocate(rthread, r0, noreg/*dummy*/, obj_size, r13, slow_case);
     }
-
-     ldr(r13, Address(rthread, in_bytes(JavaThread::tlab_top_offset())));
-
-     // check whether we have space in TLAB,
-     // rscratch1 contains pointer to just allocated obj
-      lea(r14, Address(r13, r14));
-      ldr(rscratch1, Address(rthread, in_bytes(JavaThread::tlab_end_offset())));
-
-      cmp(r14, rscratch1);
-      br(Assembler::GT, slow_case);
-
-      // OK we have room in TLAB,
-      // Set new TLAB top
-      str(r14, Address(rthread, in_bytes(JavaThread::tlab_top_offset())));
-
-      // Set new class always locked
-      mov(rscratch1, (uint64_t) markWord::always_locked_prototype().value());
-      str(rscratch1, Address(r13, oopDesc::mark_offset_in_bytes()));
-
-      store_klass_gap(r13, zr);  // zero klass gap for compressed oops
-      if (vk == NULL) {
-        // store_klass corrupts rbx, so save it in rax for later use (interpreter case only).
-         mov(r0, r1);
-      }
-
-      store_klass(r13, r1);  // klass
-
-      if (vk != NULL) {
-        // FIXME -- do the packing in-line to avoid the runtime call
-        mov(r0, r13);
-        far_call(RuntimeAddress(vk->pack_handler())); // no need for call info as this will not safepoint.
-      } else {
-
-        // We have our new buffered inline type, initialize its fields with an inline class specific handler
-        ldr(r1, Address(r0, InstanceKlass::adr_inlineklass_fixed_block_offset()));
-        ldr(r1, Address(r1, InlineKlass::pack_handler_offset()));
-
-        // Mov new class to r0 and call pack_handler
-        mov(r0, r13);
-        blr(r1);
-      }
-      b(skip);
+  } else {
+    // Call from interpreter. R0 contains ((the InlineKlass* of the return type) | 0x01)
+    andr(r1, r0, -2);
+    // get obj size
+    ldrw(r14, Address(rscratch1 /*klass*/, Klass::layout_helper_offset()));
+    if (UseTLAB) {
+      tlab_allocate(rthread, r0, r14, 0/*dummy*/, r13, r14, slow_case);
+    } else {
+      eden_allocate(rthread, r0, r14, 0/*dummy*/, r13, slow_case);
+    }
   }
-
+  if (UseTLAB || Universe::heap()->supports_inline_contig_alloc()) {
+    // 2. Initialize buffered inline instance header
+    Register buffer_obj = r0;
+    mov(rscratch1, (uint64_t) markWord::always_locked_prototype().value());
+    str(rscratch1, Address(buffer_obj, oopDesc::mark_offset_in_bytes()));
+    store_klass_gap(buffer_obj, zr);  // zero klass gap for compressed oops
+    if (vk == NULL) {
+      // store_klass corrupts r1, so save it in r13 for later use (interpreter case only).
+      mov(r13, r1);
+    }
+    store_klass(buffer_obj, r1);  // klass
+    // 3. Initialize its fields with an inline class specific handler
+    if (vk != NULL) {
+      far_call(RuntimeAddress(vk->pack_handler())); // no need for call info as this will not safepoint.
+    } else {
+      ldr(r1, Address(r13, InstanceKlass::adr_inlineklass_fixed_block_offset()));
+      ldr(r1, Address(r1, InlineKlass::pack_handler_offset()));
+      blr(r1);
+    }
+    b(skip);
+  }
   bind(slow_case);
   // We failed to allocate a new inline type, fall back to a runtime
   // call. Some oop field may be live in some registers but we can't
   // tell. That runtime call will take care of preserving them
   // across a GC if there's one.
-
+  mov(r0, rscratch1);
 
   if (from_interpreter) {
     super_call_VM_leaf(StubRoutines::store_inline_type_fields_to_buf());
